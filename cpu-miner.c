@@ -35,11 +35,14 @@
 #endif
 #include <jansson.h>
 #include <curl/curl.h>
+#ifndef USE_LOBOTOMIZED_AES
+#include <cpuid.h>
+#endif
 #include "compat.h"
 #include "miner.h"
 #include "cryptonight.h"
 
-#if defined __unix__ && (!defined __APPLE__)
+#if defined __unix__ && (!defined __APPLE__) && (!defined DISABLE_LINUX_HUGEPAGES)
 #include <sys/mman.h>
 #elif defined _WIN32
 #include <windows.h>
@@ -151,7 +154,7 @@ int opt_timeout = 0;
 static int opt_scantime = 5;
 static json_t *opt_config;
 static const bool opt_time = true;
-static enum mining_algo opt_algo = ALGO_SCRYPT;
+static enum mining_algo opt_algo = ALGO_CRYPTONIGHT;
 static int opt_n_threads;
 static int num_processors;
 static char *rpc_url;
@@ -197,17 +200,6 @@ static char const usage[] =
         "\
 Usage: " PROGRAM_NAME " [OPTIONS]\n\
 Options:\n\
-  -a, --algo=ALGO       specify the algorithm to use\n\
-                          scrypt       scrypt(1024, 1, 1) (default)\n\
-                          sha256d      SHA-256d\n\
-                          keccak       Keccak\n\
-                          quark        Quark\n\
-                          heavy        Heavy\n\
-                          skein        Skein\n\
-                          shavite3     Shavite3\n\
-                          blake        Blake\n\
-                          x11          X11\n\
-                          cryptonight  CryptoNight\n\
   -o, --url=URL         URL of mining server\n\
   -O, --userpass=U:P    username:password pair for mining server\n\
   -u, --user=USERNAME   username for mining server\n\
@@ -1059,7 +1051,7 @@ static void *miner_thread(void *userdata) {
 	persistentctx = persistentctxs[thr_id];
 	if(!persistentctx && opt_algo == ALGO_CRYPTONIGHT)
 	{
-		#if defined __unix__ && (!defined __APPLE__)
+		#if defined __unix__ && (!defined __APPLE__) && (!defined DISABLE_LINUX_HUGEPAGES)
 		persistentctx = (struct cryptonight_ctx *)mmap(0, sizeof(struct cryptonight_ctx), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE, 0, 0);
 		if(persistentctx == MAP_FAILED) persistentctx = (struct cryptonight_ctx *)malloc(sizeof(struct cryptonight_ctx));
 		madvise(persistentctx, sizeof(struct cryptonight_ctx), MADV_RANDOM | MADV_WILLNEED | MADV_HUGEPAGE);
@@ -1072,9 +1064,6 @@ static void *miner_thread(void *userdata) {
 		#endif
 	}
 	
-    if (opt_algo == ALGO_SCRYPT) {
-        scratchbuf = scrypt_buffer_alloc();
-    }
     uint32_t *nonceptr = (uint32_t*) (((char*)work.data) + (jsonrpc_2 ? 39 : 76));
 
     while (1) {
@@ -1135,6 +1124,7 @@ static void *miner_thread(void *userdata) {
                 max64 = 0xfffLL;
                 break;
             case ALGO_CRYPTONIGHT:
+
                 max64 = 0x40LL;
                 break;
             default:
@@ -1151,57 +1141,8 @@ static void *miner_thread(void *userdata) {
         gettimeofday(&tv_start, NULL );
 
         /* scan nonces for a proof-of-work hash */
-        switch (opt_algo) {
-        case ALGO_SCRYPT:
-            rc = scanhash_scrypt(thr_id, work.data, scratchbuf, work.target,
-                    max_nonce, &hashes_done);
-            break;
-
-        case ALGO_SHA256D:
-            rc = scanhash_sha256d(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-
-        case ALGO_KECCAK:
-            rc = scanhash_keccak(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-
-        case ALGO_HEAVY:
-            rc = scanhash_heavy(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-
-        case ALGO_QUARK:
-            rc = scanhash_quark(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-
-        case ALGO_SKEIN:
-            rc = scanhash_skein(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_SHAVITE3:
-            rc = scanhash_ink(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_BLAKE:
-            rc = scanhash_blake(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_X11:
-            rc = scanhash_x11(thr_id, work.data, work.target, max_nonce,
-                    &hashes_done);
-            break;
-        case ALGO_CRYPTONIGHT:
             rc = scanhash_cryptonight(thr_id, work.data, work.target,
                     max_nonce, &hashes_done, persistentctx);
-            break;
-
-        default:
-            /* should never happen */
-            goto out;
-        }
 
         /* record scanhash elapsed time */
         gettimeofday(&tv_end, NULL );
@@ -1545,7 +1486,7 @@ static void parse_arg(int key, char *arg) {
     case 'a':
         for (i = 0; i < ARRAY_SIZE(algo_names); i++) {
             if (algo_names[i] && !strcmp(arg, algo_names[i])) {
-                opt_algo = i;
+                //opt_algo = i;
                 break;
             }
         }
@@ -1796,8 +1737,32 @@ static void signal_handler(int sig) {
 
 int main(int argc, char *argv[]) {
     struct thr_info *thr;
+    unsigned int tmp1, tmp2, tmp3, tmp4;
     long flags;
     int i;
+	
+	#ifndef USE_LOBOTOMIZED_AES
+	// If the CPU doesn't support CPUID feature
+	// flags, it's WAY too old to have AES-NI
+	if(__get_cpuid_max(0, &tmp1) < 1)
+	{
+		applog(LOG_ERR, "CPU does not have AES-NI, which is required.");
+		return(0);
+	}
+	
+	// We already checked the max supported
+	// function, so we don't need to check
+	// this for error.
+	__get_cpuid(1, &tmp1, &tmp2, &tmp3, &tmp4);
+	
+	// Mask out all bits but bit 25; if it's
+	// set, we have AES-NI, if not, nope.
+	if(!(tmp3 & 0x2000000))
+	{
+		applog(LOG_ERR, "CPU does not have AES-NI, which is required.");
+		return(0);
+	}
+	#endif
 	
 	#ifdef __unix__
 	if(geteuid()) applog(LOG_INFO, "I go faster as root.");
@@ -1809,14 +1774,8 @@ int main(int argc, char *argv[]) {
     /* parse command line */
     parse_cmdline(argc, argv);
 
-    if (opt_algo == ALGO_QUARK) {
-        init_quarkhash_contexts();
-    } else if (opt_algo == ALGO_BLAKE) {
-        init_blakehash_contexts();
-    } else if(opt_algo == ALGO_CRYPTONIGHT) {
-        jsonrpc_2 = true;
-        applog(LOG_INFO, "Using JSON-RPC 2.0");
-    }
+    jsonrpc_2 = true;
+    applog(LOG_INFO, "Using JSON-RPC 2.0");
 
 
     if (!opt_benchmark && !rpc_url) {

@@ -141,14 +141,7 @@ const uint32_t TestTable4[256]  __attribute((aligned(16))) ={
     0x82C34141,0x29B09999,0x5A772D2D,0x1E110F0F,0x7BCBB0B0,0xA8FC5454,0x6DD6BBBB,0x2C3A1616
 };
 
-typedef struct _reg_ {
-	uint8_t al;
-	uint8_t ah;
-	uint8_t eal;
-	uint8_t eah;
-} regs;
-
-static inline void SubAndShiftAndMixAddRound(uint32_t *restrict out, uint32_t *restrict temp, uint32_t *restrict AesEncKey)
+static inline void SubAndShiftAndMixAddRound(uint32_t *restrict out, uint32_t *temp, uint32_t *restrict AesEncKey)
 {
 	uint8_t *state = &temp[0];
 	
@@ -169,24 +162,42 @@ static inline void SubAndShiftAndMixAddRoundInPlace(uint32_t *restrict temp, uin
 	temp[3]= TestTable2[state[1]] ^ TestTable3[state[6]] ^ TestTable4[state[11]] ^ TestTable1[state[12]] ^ AesEncKey[3];
 }
 
-static inline void mul_sum_xor_dst(const uint8_t *restrict a, uint8_t *restrict c, uint8_t *restrict dst) {
-    //uint64_t hi, lo = mul128(((uint64_t*) a)[0], ((uint64_t*) dst)[0], &hi) + ((uint64_t*) c)[1];
-    //hi += ((uint64_t*) c)[0];
-	uint64_t hi, lo;
-	
-	__asm__("mulq %3\n\t"
-		  : "=d" (hi),
-		"=a" (lo)
-		  : "%a" (((uint64_t *)a)[0]),
-		"rm" (((uint64_t *)dst)[0])
-		  : "cc" );
-	lo += ((uint64_t *)c)[1];
+static inline uint64_t mul128(uint64_t multiplier, uint64_t multiplicand, uint64_t *product_hi)
+{
+  // multiplier   = ab = a * 2^32 + b
+  // multiplicand = cd = c * 2^32 + d
+  // ab * cd = a * c * 2^64 + (a * d + b * c) * 2^32 + b * d
+  uint64_t a = multiplier >> 32;
+  uint64_t b = multiplier & 0xFFFFFFFF;
+  uint64_t c = multiplicand >> 32;
+  uint64_t d = multiplicand & 0xFFFFFFFF;
+
+  //uint64_t ac = a * c;
+  uint64_t ad = a * d;
+  //uint64_t bc = b * c;
+  uint64_t bd = b * d;
+
+  uint64_t adbc = ad + (b * c);
+  uint64_t adbc_carry = adbc < ad ? 1 : 0;
+
+  // multiplier * multiplicand = product_hi * 2^64 + product_lo
+  uint64_t product_lo = bd + (adbc << 32);
+  uint64_t product_lo_carry = product_lo < bd ? 1 : 0;
+  *product_hi = (a * c) + (adbc >> 32) + (adbc_carry << 32) + product_lo_carry;
+  //assert(ac <= *product_hi);
+
+  return product_lo;
+}
+
+static inline void mul_sum_xor_dst(const uint8_t *a, uint8_t *c, uint8_t *dst)
+{
+    uint64_t hi, lo = mul128(((uint64_t *)a)[0], ((uint64_t *)dst)[0], &hi) + ((uint64_t *)c)[1];
 	hi += ((uint64_t *)c)[0];
 	
-    ((uint64_t*) c)[0] = ((uint64_t*) dst)[0] ^ hi;
-    ((uint64_t*) c)[1] = ((uint64_t*) dst)[1] ^ lo;
-    ((uint64_t*) dst)[0] = hi;
-    ((uint64_t*) dst)[1] = lo;
+    ((uint64_t *)c)[0] = ((uint64_t*) dst)[0] ^ hi;
+    ((uint64_t *)c)[1] = ((uint64_t*) dst)[1] ^ lo;
+    ((uint64_t *)dst)[0] = hi;
+    ((uint64_t *)dst)[1] = lo;
 }
 
 static inline void xor_blocks(uint8_t *restrict a, const uint8_t *restrict b) {
@@ -199,7 +210,7 @@ void cryptonight_hash_ctx(void *restrict output, const void *restrict input, str
     ctx->aes_ctx = (oaes_ctx*) oaes_alloc();
     size_t i, j;
     //hash_process(&ctx->state.hs, (const uint8_t*) input, 76);
-    keccak1600((const uint8_t *)input, 76, &ctx->state.hs, 200);
+    keccak((const uint8_t *)input, 76, &ctx->state.hs, 200);
     memcpy(ctx->text, ctx->state.init, INIT_SIZE_BYTE);
     
     oaes_key_import_data(ctx->aes_ctx, ctx->state.hs.b, AES_KEY_SIZE);
@@ -274,7 +285,8 @@ void cryptonight_hash_ctx(void *restrict output, const void *restrict input, str
 	}
 		
     memcpy(ctx->state.init, ctx->text, INIT_SIZE_BYTE);
-    hash_permutation(&ctx->state.hs);
+    //hash_permutation(&ctx->state.hs);
+    keccakf(&ctx->state.hs, 24);
     /*memcpy(hash, &state, 32);*/
     extra_hashes[ctx->state.hs.b[0] & 3](&ctx->state, 200, output);
     oaes_free((OAES_CTX **) &ctx->aes_ctx);
